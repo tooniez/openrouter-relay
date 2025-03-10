@@ -1,15 +1,29 @@
 // Copyright (c) 2024 Cloudflare, Inc.
 // Licensed under the MIT license found in the LICENSE file or at https://opensource.org/licenses/MIT
 
-import { RealtimeClient } from "@openai/realtime-api-beta";
-
 type Env = {
-  OPENAI_API_KEY: string;
+  OPENROUTER_API_KEY: string;
 };
 
+interface ChatMessage {
+  role: string;
+  content: string;
+}
+
+interface RequestBody {
+  model?: string;
+  messages: ChatMessage[];
+  temperature?: number;
+  max_tokens?: number;
+  top_p?: number;
+  frequency_penalty?: number;
+  presence_penalty?: number;
+  [key: string]: unknown;
+}
+
 const DEBUG = false; // set as true to see debug logs
-const MODEL = "gpt-4o-realtime-preview-2024-10-01";
-const OPENAI_URL = "wss://api.openai.com/v1/realtime";
+const MODEL = "google/gemini-2.0-pro-exp-02-05:free"; // default model
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 function owrLog(...args: unknown[]) {
   if (DEBUG) {
@@ -21,126 +35,126 @@ function owrError(...args: unknown[]) {
   console.error("[owr error]", ...args);
 }
 
-async function createRealtimeClient(
+async function handleStream(
   request: Request,
   env: Env,
   ctx: ExecutionContext
-) {
-  const webSocketPair = new WebSocketPair();
-  const [clientSocket, serverSocket] = Object.values(webSocketPair);
-
-  serverSocket.accept();
-
-  // Copy protocol headers
-  const responseHeaders = new Headers();
-  const protocolHeader = request.headers.get("Sec-WebSocket-Protocol");
-  let apiKey = env.OPENAI_API_KEY;
-  if (protocolHeader) {
-    const requestedProtocols = protocolHeader.split(",").map((p) => p.trim());
-    if (requestedProtocols.includes("realtime")) {
-      // Not exactly sure why this protocol needs to be accepted
-      responseHeaders.set("Sec-WebSocket-Protocol", "realtime");
-    }
-  }
+): Promise<Response> {
+  const apiKey = env.OPENROUTER_API_KEY;
 
   if (!apiKey) {
     owrError(
-      "Missing OpenAI API key. Did you forget to set OPENAI_API_KEY in .dev.vars (for local dev) or with wrangler secret put OPENAI_API_KEY (for production)?"
+      "Missing OpenRouter API key. Did you forget to set OPENROUTER_API_KEY in .dev.vars (for local dev) or with wrangler secret put OPENROUTER_API_KEY (for production)?"
     );
     return new Response("Missing API key", { status: 401 });
   }
 
-  let realtimeClient: RealtimeClient | null = null;
-
-  // Create RealtimeClient
+  // Parse the incoming request body
+  let requestBody: RequestBody;
   try {
-    owrLog("Creating OpenAIRealtimeClient");
-    realtimeClient = new RealtimeClient({
-      apiKey,
-      debug: DEBUG,
-      url: OPENAI_URL,
-    });
+    requestBody = await request.json() as RequestBody;
   } catch (e) {
-    owrError("Error creating OpenAI RealtimeClient", e);
-    serverSocket.close();
-    return new Response("Error creating OpenAI RealtimeClient", {
-      status: 500,
-    });
+    owrError("Error parsing request body", e);
+    return new Response("Invalid request body", { status: 400 });
   }
 
-  // Relay: OpenAI Realtime API Event -> Client
-  realtimeClient.realtime.on("server.*", (event: { type: string }) => {
-    serverSocket.send(JSON.stringify(event));
-  });
+  // Prepare the request to OpenRouter
+  const { messages, model: requestModel, ...restOfBody } = requestBody;
+  const payload = {
+    model: requestModel || MODEL,
+    messages,
+    stream: true,
+    ...restOfBody,
+  };
 
-  realtimeClient.realtime.on("close", (metadata: { error: boolean }) => {
-    owrLog(
-      `Closing server-side because I received a close event: (error: ${metadata.error})`
-    );
-    serverSocket.close();
-  });
+  // Create transform stream to handle SSE data
+  const stream = new TransformStream();
+  const writer = stream.writable.getWriter();
+  const encoder = new TextEncoder();
 
-  // Relay: Client -> OpenAI Realtime API Event
-  const messageQueue: string[] = [];
+  // Make request to OpenRouter
+  try {
+    const response = await fetch(OPENROUTER_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": request.headers.get("origin") || "https://localhost",
+        "X-Title": "OpenRouter Relay"
+      },
+      body: JSON.stringify(payload),
+    });
 
-  serverSocket.addEventListener("message", (event: MessageEvent) => {
-    const messageHandler = (data: string) => {
+    if (!response.ok) {
+      const error = await response.text();
+      owrError("OpenRouter API error", error);
+      return new Response(`OpenRouter API error: ${error}`, { status: response.status });
+    }
+
+    if (!response.body) {
+      throw new Error("No response body");
+    }
+
+    // Process the stream
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    // Read the stream
+    const processStream = async () => {
       try {
-        const parsedEvent = JSON.parse(data);
-        realtimeClient.realtime.send(parsedEvent.type, parsedEvent);
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            await writer.close();
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+
+          // Process complete lines
+          let lineEnd;
+          while ((lineEnd = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, lineEnd).trim();
+            buffer = buffer.slice(lineEnd + 1);
+
+            if (line.startsWith("data: ")) {
+              const data = line.slice(6);
+              
+              if (data === "[DONE]") {
+                continue;
+              }
+
+              try {
+                const parsed = JSON.parse(data);
+                await writer.write(encoder.encode(`data: ${JSON.stringify(parsed)}\n\n`));
+              } catch (e) {
+                owrError("Error parsing SSE data", e);
+              }
+            }
+          }
+        }
       } catch (e) {
-        owrError("Error parsing event from client", data);
+        owrError("Error processing stream", e);
+        await writer.abort(e);
       }
     };
 
-    const data =
-      typeof event.data === "string" ? event.data : event.data.toString();
-    if (!realtimeClient.isConnected()) {
-      messageQueue.push(data);
-    } else {
-      messageHandler(data);
-    }
-  });
+    // Start processing the stream
+    ctx.waitUntil(processStream());
 
-  serverSocket.addEventListener("close", ({ code, reason }) => {
-    owrLog(
-      `Closing server-side because the client closed the connection: ${code} ${reason}`
-    );
-    realtimeClient.disconnect();
-    messageQueue.length = 0;
-  });
-
-  let model: string | undefined = MODEL;
-
-  // uncomment this to use a model from specified by the client
-
-  // const modelParam = new URL(request.url).searchParams.get("model");
-  // if (modelParam) {
-  //   model = modelParam;
-  // }
-
-  // Connect to OpenAI Realtime API
-  try {
-    owrLog(`Connecting to OpenAI...`);
-    // @ts-expect-error Waiting on https://github.com/openai/openai-realtime-api-beta/pull/52
-    await realtimeClient.connect({ model });
-    owrLog(`Connected to OpenAI successfully!`);
-    while (messageQueue.length) {
-      const message = messageQueue.shift();
-      if (message) {
-        serverSocket.send(message);
-      }
-    }
+    // Return the stream
+    return new Response(stream.readable, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+      },
+    });
   } catch (e) {
-    owrError("Error connecting to OpenAI", e);
-    return new Response("Error connecting to OpenAI", { status: 500 });
+    owrError("Error making request to OpenRouter", e);
+    return new Response("Error making request to OpenRouter", { status: 500 });
   }
-
-  return new Response(null, {
-    status: 101,
-    headers: responseHeaders,
-    webSocket: clientSocket,
-  });
 }
 
 export default {
@@ -149,14 +163,11 @@ export default {
     env: Env,
     ctx: ExecutionContext
   ): Promise<Response> {
-    // This would be a good place to add logic for
-    // authentication, rate limiting, etc.
-    // You could also do matching on the path or other things here.
-    const upgradeHeader = request.headers.get("Upgrade");
-    if (upgradeHeader === "websocket") {
-      return createRealtimeClient(request, env, ctx);
+    // Only accept POST requests
+    if (request.method !== "POST") {
+      return new Response("Method not allowed", { status: 405 });
     }
 
-    return new Response("Expected Upgrade: websocket", { status: 426 });
+    return handleStream(request, env, ctx);
   },
 };
