@@ -1,11 +1,25 @@
 // Copyright (c) 2024 Cloudflare, Inc.
 // Licensed under the MIT license found in the LICENSE file or at https://opensource.org/licenses/MIT
 
-import { RealtimeClient } from "@openai/realtime-api-beta";
-
 type Env = {
-  OPENAI_API_KEY: string;
+  OPENROUTER_API_KEY: string;
 };
+
+interface ChatMessage {
+  role: string;
+  content: string;
+}
+
+interface RequestBody {
+  model?: string;
+  messages: ChatMessage[];
+  temperature?: number;
+  max_tokens?: number;
+  top_p?: number;
+  frequency_penalty?: number;
+  presence_penalty?: number;
+  [key: string]: unknown;
+}
 
 const DEBUG = false; // set as true to see debug logs
 const MODEL = "gpt-4o-realtime-preview-2024-10-01";
