@@ -22,8 +22,8 @@ interface RequestBody {
 }
 
 const DEBUG = false; // set as true to see debug logs
-const MODEL = "gpt-4o-realtime-preview-2024-10-01";
-const OPENAI_URL = "wss://api.openai.com/v1/realtime";
+const MODEL = "google/gemini-2.0-pro-exp-02-05:free"; // default model
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 function owrLog(...args: unknown[]) {
   if (DEBUG) {
